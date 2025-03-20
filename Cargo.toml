@@ -1,0 +1,17 @@
+[package]
+name = "zot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4.4"    # Framework web pour l'API
+actix-multipart = "0.6"  # Gestion des fichiers multipart (upload)
+reqwest = { version = "0.11", features = ["multipart", "json"] }  # Client HTTP pour envoyer à Zot
+tokio = { version = "1", features = ["full"] }  # Runtime async
+futures = "0.3"      # Gestion des futures pour multipart
+sha2 = "0.10"  # Pour calculer le SHA256
+hex = "0.4"    # Pour convertir le hash en hexadécimal
+serde = { version = "1.0", features = ["derive"] }  # Pour sérialiser le manifest
+serde_json = "1.0"  # Pour JSON
+base64 = "0.22.1"
+chrono = "0.4.40"
