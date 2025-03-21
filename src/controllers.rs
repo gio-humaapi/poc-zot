@@ -1,14 +1,16 @@
-use std::fs;
-use actix_web::{get, post, put, HttpResponse, Responder};
-use actix_multipart::Multipart;
-use base64::Engine;
-use futures::StreamExt;
-use reqwest::Client;
 use crate::entities::{ComponentResponse, Config, Layer, Manifest, ManifestMetadata, ZotConfig};
 use crate::services::{calculate_sha256, init_upload, upload_blob};
+use actix_multipart::Multipart;
+use actix_web::{get, post, put, web, HttpResponse, Responder};
+use base64::Engine;
+use chrono::Utc;
+use futures::StreamExt;
+use reqwest::Client;
+use serde_json::Value;
+use std::fs;
 
 #[post("/api/v1/components")]
-async fn push_component(mut payload: Multipart) -> impl Responder {
+pub async fn push_component(mut payload: Multipart) -> impl Responder {
     let client = Client::new();
     let zot_config = ZotConfig {
         url: "http://localhost:5000".to_string(),
@@ -19,7 +21,6 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
     let mut manifest: Option<ManifestMetadata> = None;
     let mut wasm_file: Option<(String, Vec<u8>)> = None;
 
-    // Traitement du payload multipart
     while let Some(item) = payload.next().await {
         let mut field = match item {
             Ok(field) => field,
@@ -59,12 +60,10 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
         None => return HttpResponse::BadRequest().body("Fichier .wasm manquant"),
     };
 
-    // Calcul des digests
     let layer_digest = calculate_sha256(&wasm_content);
     let config_content = b"{}";
     let config_digest = calculate_sha256(config_content);
 
-    // Upload du layer
     let layer_upload_url = match init_upload(
         &client,
         &zot_config.url,
@@ -83,7 +82,7 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
         &layer_upload_url,
         &zot_config.username,
         &zot_config.password,
-        &wasm_content, // Passé par référence
+        &wasm_content,
         &layer_digest,
     )
     .await
@@ -91,7 +90,6 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
         return HttpResponse::InternalServerError().body(e);
     }
 
-    // Upload de la config
     let config_upload_url = match init_upload(
         &client,
         &zot_config.url,
@@ -110,7 +108,7 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
         &config_upload_url,
         &zot_config.username,
         &zot_config.password,
-        &config_content.to_vec(), // Converti en Vec pour compatibilité
+        &config_content.to_vec(),
         &config_digest,
     )
     .await
@@ -118,7 +116,79 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
         return HttpResponse::InternalServerError().body(e);
     }
 
-    // Création et envoi du manifest
+    let mut annotations: serde_json::Map<String, Value> = serde_json::Map::new();
+    annotations.insert(
+        "org.opencontainers.image.title".to_string(),
+        Value::String(manifest.name.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.architecture".to_string(),
+        Value::String(manifest.architecture.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.os".to_string(),
+        Value::String(manifest.os.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.description".to_string(),
+        Value::String(manifest.description.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.author".to_string(),
+        Value::String(manifest.author.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.version".to_string(),
+        Value::String(manifest.tag.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.created".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+
+    if let Some(url) = &manifest.url {
+        annotations.insert(
+            "org.opencontainers.image.url".to_string(),
+            Value::String(url.clone()),
+        );
+    }
+    if let Some(source) = &manifest.source {
+        annotations.insert(
+            "org.opencontainers.image.source".to_string(),
+            Value::String(source.clone()),
+        );
+    }
+    if let Some(revision) = &manifest.revision {
+        annotations.insert(
+            "org.opencontainers.image.revision".to_string(),
+            Value::String(revision.clone()),
+        );
+    }
+    if let Some(licenses) = &manifest.licenses {
+        annotations.insert(
+            "org.opencontainers.image.licenses".to_string(),
+            Value::String(licenses.clone()),
+        );
+    }
+    if let Some(vendor) = &manifest.vendor {
+        annotations.insert(
+            "org.opencontainers.image.vendor".to_string(),
+            Value::String(vendor.clone()),
+        );
+    }
+    if let Some(documentation) = &manifest.documentation {
+        annotations.insert(
+            "org.opencontainers.image.documentation".to_string(),
+            Value::String(documentation.clone()),
+        );
+    }
+    if let Some(component_type) = &manifest.component_type {
+        annotations.insert(
+            "com.aneocorp.component.type".to_string(),
+            Value::String(component_type.clone()),
+        );
+    }
+
     let manifest_data = Manifest {
         schemaVersion: 2,
         mediaType: "application/vnd.oci.image.manifest.v1+json".to_string(),
@@ -132,14 +202,7 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
             size: wasm_content.len() as i64,
             digest: layer_digest,
         }],
-        annotations: Some(serde_json::json!({
-            "org.opencontainers.image.title": manifest.name,
-            "org.opencontainers.image.architecture": manifest.architecture,
-            "org.opencontainers.image.os": manifest.os,
-            "org.opencontainers.image.description": manifest.description,
-            "org.opencontainers.image.authors": manifest.author,
-            "org.opencontainers.image.version": manifest.tag 
-        })),
+        annotations: Some(Value::Object(annotations)),
     };
 
     let manifest_url = format!(
@@ -164,9 +227,7 @@ async fn push_component(mut payload: Multipart) -> impl Responder {
 }
 
 #[get("/api/v1/{repository}/components/{reference}")]
-async fn get_component(
-    path: actix_web::web::Path<(String, String)>,
-) -> impl Responder {
+pub async fn get_component(path: web::Path<(String, String)>) -> impl Responder {
     let (repository, reference) = path.into_inner();
     let client = Client::new();
     let zot_config = ZotConfig {
@@ -175,8 +236,10 @@ async fn get_component(
         password: "helptheworld".to_string(),
     };
 
-    // Étape 1 : Récupérer le manifest
-    let manifest_url = format!("{}/v2/{}/manifests/{}", zot_config.url, repository, reference);
+    let manifest_url = format!(
+        "{}/v2/{}/manifests/{}",
+        zot_config.url, repository, reference
+    );
     let manifest_response = client
         .get(&manifest_url)
         .basic_auth(&zot_config.username, Some(&zot_config.password))
@@ -185,18 +248,15 @@ async fn get_component(
         .await;
 
     let manifest = match manifest_response {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<Manifest>().await {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    return HttpResponse::InternalServerError()
-                        .body(format!("Erreur parsing manifest: {}", e))
-                }
+        Ok(resp) if resp.status().is_success() => match resp.json::<Manifest>().await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("Erreur parsing manifest: {}", e))
             }
-        }
+        },
         Ok(resp) => {
-            return HttpResponse::NotFound()
-                .body(format!("Manifest non trouvé: {}", resp.status()))
+            return HttpResponse::NotFound().body(format!("Manifest non trouvé: {}", resp.status()))
         }
         Err(e) => {
             return HttpResponse::InternalServerError()
@@ -204,11 +264,13 @@ async fn get_component(
         }
     };
 
-    // Étape 2 : Récupérer le binaire WASM si disponible dans le manifest
     let wasm_binary = if let Some(ref manifest) = manifest {
         if let Some(layer) = manifest.layers.first() {
             if layer.mediaType == "application/wasm" {
-                let blob_url = format!("{}/v2/{}/blobs/{}", zot_config.url, repository, layer.digest);
+                let blob_url = format!(
+                    "{}/v2/{}/blobs/{}",
+                    zot_config.url, repository, layer.digest
+                );
                 let blob_response = client
                     .get(&blob_url)
                     .basic_auth(&zot_config.username, Some(&zot_config.password))
@@ -216,18 +278,13 @@ async fn get_component(
                     .await;
 
                 match blob_response {
-                    Ok(resp) if resp.status().is_success() => {
-                        match resp.bytes().await {
-                            Ok(bytes) => {
-                                let engine = base64::engine::general_purpose::STANDARD;
-                                Some(engine.encode(bytes))
-                            },
-                            Err(e) => {
-                                return HttpResponse::InternalServerError()
-                                    .body(format!("Erreur lecture binaire: {}", e))
-                            }
+                    Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                        Ok(bytes) => Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                        Err(e) => {
+                            return HttpResponse::InternalServerError()
+                                .body(format!("Erreur lecture binaire: {}", e))
                         }
-                    }
+                    },
                     Ok(resp) => {
                         return HttpResponse::InternalServerError()
                             .body(format!("Erreur récupération binaire: {}", resp.status()))
@@ -247,7 +304,6 @@ async fn get_component(
         None
     };
 
-    // Construire la réponse
     let response = ComponentResponse {
         manifest,
         wasm_binary,
@@ -257,8 +313,8 @@ async fn get_component(
 }
 
 #[put("/api/v1/{repository}/components/{reference}")]
-async fn update_component(
-    path: actix_web::web::Path<(String, String)>,
+pub async fn update_component(
+    path: web::Path<(String, String)>,
     mut payload: Multipart,
 ) -> impl Responder {
     let (repository, reference) = path.into_inner();
@@ -272,7 +328,6 @@ async fn update_component(
     let mut manifest: Option<ManifestMetadata> = None;
     let mut wasm_file: Option<(String, Vec<u8>)> = None;
 
-    // Traitement du payload multipart
     while let Some(item) = payload.next().await {
         let mut field = match item {
             Ok(field) => field,
@@ -303,29 +358,24 @@ async fn update_component(
         }
     }
 
-    // Vérification des données fournies
     let manifest = match manifest {
         Some(m) => m,
         None => return HttpResponse::BadRequest().body("Manifest.json manquant"),
     };
 
-    // Si aucun nouveau binaire n'est fourni, on ne met à jour que le manifest
     let (wasm_path, wasm_content) = match wasm_file {
         Some(f) => f,
-        None => (String::new(), Vec::new()), // Valeurs par défaut si pas de binaire
+        None => (String::new(), Vec::new()),
     };
 
-    // Calcul des digests
     let layer_digest = if !wasm_content.is_empty() {
         calculate_sha256(&wasm_content)
     } else {
-        // On pourrait récupérer l'ancien digest ici si nécessaire, pour l'instant on échoue
         return HttpResponse::BadRequest().body("Aucun nouveau binaire fourni et digest actuel non géré");
     };
-    let config_content = b"{}"; // Config minimale
+    let config_content = b"{}";
     let config_digest = calculate_sha256(config_content);
 
-    // Upload du nouveau binaire s'il est fourni
     if !wasm_content.is_empty() {
         let layer_upload_url = match init_upload(
             &client,
@@ -354,7 +404,6 @@ async fn update_component(
         }
     }
 
-    // Upload de la config (toujours mis à jour pour simplifier)
     let config_upload_url = match init_upload(
         &client,
         &zot_config.url,
@@ -381,7 +430,58 @@ async fn update_component(
         return HttpResponse::InternalServerError().body(e);
     }
 
-    // Création du nouveau manifest
+    let mut annotations: serde_json::Map<String, Value> = serde_json::Map::new();
+    annotations.insert(
+        "org.opencontainers.image.title".to_string(),
+        Value::String(manifest.name.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.architecture".to_string(),
+        Value::String(manifest.architecture.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.os".to_string(),
+        Value::String(manifest.os.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.description".to_string(),
+        Value::String(manifest.description.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.author".to_string(),
+        Value::String(manifest.author.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.version".to_string(),
+        Value::String(manifest.tag.clone()),
+    );
+    annotations.insert(
+        "org.opencontainers.image.created".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+
+    if let Some(url) = &manifest.url {
+        annotations.insert("org.opencontainers.image.url".to_string(), Value::String(url.clone()));
+    }
+    if let Some(source) = &manifest.source {
+        annotations.insert("org.opencontainers.image.source".to_string(), Value::String(source.clone()));
+    }
+    if let Some(revision) = &manifest.revision {
+        annotations.insert("org.opencontainers.image.revision".to_string(), Value::String(revision.clone()));
+    }
+    if let Some(licenses) = &manifest.licenses {
+        annotations.insert("org.opencontainers.image.licenses".to_string(), Value::String(licenses.clone()));
+    }
+    if let Some(vendor) = &manifest.vendor {
+        annotations.insert("org.opencontainers.image.vendor".to_string(), Value::String(vendor.clone()));
+    }
+    if let Some(documentation) = &manifest.documentation {
+        annotations.insert("org.opencontainers.image.documentation".to_string(), Value::String(documentation.clone()));
+    }
+    if let Some(component_type) = &manifest.component_type {
+        annotations.insert("com.aneocorp.component.type".to_string(), Value::String(component_type.clone()));
+    }
+
     let manifest_data = Manifest {
         schemaVersion: 2,
         mediaType: "application/vnd.oci.image.manifest.v1+json".to_string(),
@@ -397,20 +497,11 @@ async fn update_component(
                 digest: layer_digest,
             }]
         } else {
-            // Si pas de nouveau binaire, on pourrait récupérer l'ancien layer ici
             vec![]
         },
-        annotations: Some(serde_json::json!({
-            "org.opencontainers.image.title": manifest.name,
-            "org.opencontainers.image.architecture": manifest.architecture,
-            "org.opencontainers.image.os": manifest.os,
-            "org.opencontainers.image.description": manifest.description,
-            "org.opencontainers.image.authors": manifest.author,
-            "org.opencontainers.image.version": manifest.tag // Ajout de la version ici
-        })),
+        annotations: Some(Value::Object(annotations)),
     };
 
-    // Mise à jour du manifest dans Zot
     let manifest_url = format!("{}/v2/{}/manifests/{}", zot_config.url, repository, reference);
     let response = client
         .put(&manifest_url)
@@ -420,11 +511,10 @@ async fn update_component(
         .send()
         .await;
 
-    // Nettoyage si un fichier temporaire a été créé
     if !wasm_path.is_empty() {
         fs::remove_file(&wasm_path).unwrap();
     }
-    
+
     match response {
         Ok(resp) if resp.status().is_success() => HttpResponse::Ok().body("Mise à jour réussie!"),
         Ok(resp) => HttpResponse::BadRequest().body(format!("Erreur mise à jour: {}", resp.status())),

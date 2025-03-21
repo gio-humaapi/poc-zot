@@ -12,14 +12,14 @@ pub async fn upload_blob(
     url: &str,
     username: &str,
     password: &str,
-    content: &Vec<u8>, // Changé en référence
+    content: &Vec<u8>,
     digest: &str,
 ) -> Result<(), String> {
     let response = client
         .put(url)
         .basic_auth(username, Some(password))
         .query(&[("digest", digest)])
-        .body(content.clone()) // On clone ici si nécessaire pour reqwest
+        .body(content.clone())
         .header("Content-Type", "application/octet-stream")
         .send()
         .await
@@ -60,7 +60,6 @@ pub async fn init_upload(
     Ok(if location.starts_with("http") {
         location
     } else {
-        println!("Location: {}", location);
         format!("{}{}", base_url, location)
     })
 }
